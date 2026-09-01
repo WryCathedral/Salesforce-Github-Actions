@@ -75,22 +75,26 @@ jobs:
           fi
           sf org login jwt --client-id "$SF_CLIENT_ID" --jwt-key-file "$GITHUB_WORKSPACE/privatekey.key" --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias "$SF_ALIAS" $extra
 
-      - name: Install the SFDX CLI Scanner
+      - name: Install Salesforce Code Analyzer
         if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
-        run: echo 'y' | sf plugins install @salesforce/sfdx-scanner
+        run: echo 'y' | sf plugins install code-analyzer
 
-      - name: Run SFDX CLI Scanner on delta
+      - name: Run Code Analyzer on delta
         if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
         run: |
           mkdir -p changed-sources reports
           sf sgd source delta --to "HEAD" --from "HEAD^" --output-dir changed-sources --generate-delta
-          sfdx scanner:run -f html -t "changed-sources/force-app" -e "eslint,retire-js,pmd,cpd" -c "Design,Best Practices,Code Style,Performance,Security" --outfile reports/scan-reports.html
+          if [ ! -d changed-sources/force-app ] || [ -z "$(find changed-sources/force-app -type f 2>/dev/null)" ]; then
+            echo "No force-app delta to scan; skipping Code Analyzer."
+            exit 0
+          fi
+          sf code-analyzer run --workspace ./changed-sources/force-app --output-file reports/code-analyzer-report.csv
 
       - uses: actions/upload-artifact@v4
         if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
         with:
           name: cli-scan-report
-          path: reports/scan-reports.html
+          path: reports/
           if-no-files-found: warn
 
       - name: Validate Salesforce (delta dry-run)
