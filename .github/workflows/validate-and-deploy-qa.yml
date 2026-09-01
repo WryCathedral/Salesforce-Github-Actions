@@ -1,0 +1,209 @@
+# Mirrors ADO Infrastructure/templates/jobs/build.yml:
+# always install CLI + JWT; validate on PullRequest; deploy when the run is on develop (push).
+name: Validate and deploy to QA
+
+on:
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened, edited, closed]
+  push:
+    branches: [develop]
+
+permissions: write-all
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && format('qa-validate-pr-{0}', github.event.pull_request.number) || 'qa-deploy-develop' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+
+jobs:
+  salesforce_ci_build:
+    name: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && 'Validating (qa)' || 'Deploying (qa)' }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.action != 'closed') || (github.event_name == 'push') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    environment: qa
+    env:
+      SF_CLI_VERSION: ${{ vars.SF_CLI_VERSION != '' && vars.SF_CLI_VERSION || '2.130.6' }}
+      SF_RUN_CODE_ANALYZER: ${{ vars.SF_RUN_CODE_ANALYZER }}
+      SF_JWT_PRIVATE_KEY: ${{ secrets.SF_JWT_PRIVATE_KEY }}
+      SF_USERNAME: ${{ secrets.SF_USERNAME }}
+      SF_IS_DEV_HUB: ${{ secrets.SF_IS_DEV_HUB }}
+      SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+      SF_INSTANCE_URL: ${{ secrets.SF_INSTANCE_URL }}
+      SF_ALIAS: ${{ secrets.SF_ALIAS }}
+      SYSTEM_PULLREQUEST_TARGETBRANCH: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || '' }}
+      BUILD_SOURCEBRANCH: ${{ github.ref }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'node'
+
+      - name: Install NPM
+        run: npm install
+
+      - name: Install the SFDX CLI
+        run: |
+          npm install @salesforce/cli@${{ env.SF_CLI_VERSION }} --global
+          sf --version
+          sf force --help
+
+      - name: Install the sfdx-git-delta plugin
+        run: echo 'y' | sf plugins install sfdx-git-delta@stable
+
+      - name: Write JWT private key
+        run: |
+          if [ -z "$SF_JWT_PRIVATE_KEY" ]; then
+            echo "SF_JWT_PRIVATE_KEY is not set in the qa environment."
+            exit 1
+          fi
+          printf '%s\n' "$SF_JWT_PRIVATE_KEY" > "$GITHUB_WORKSPACE/privatekey.key"
+          chmod 600 "$GITHUB_WORKSPACE/privatekey.key"
+
+      # --- PullRequest: authenticate and validate (ADO Build.Reason == PullRequest) ---
+      - name: Authenticate Salesforce ORG (validate)
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+        run: |
+          extra=""
+          if [ "$SF_IS_DEV_HUB" = "true" ]; then
+            extra="--set-default-dev-hub"
+          fi
+          sf org login jwt --client-id "$SF_CLIENT_ID" --jwt-key-file "$GITHUB_WORKSPACE/privatekey.key" --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias "$SF_ALIAS" $extra
+
+      - name: Install the SFDX CLI Scanner
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
+        run: echo 'y' | sf plugins install @salesforce/sfdx-scanner
+
+      - name: Run SFDX CLI Scanner on delta
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
+        run: |
+          mkdir -p changed-sources reports
+          sf sgd source delta --to "HEAD" --from "HEAD^" --output-dir changed-sources --generate-delta
+          sfdx scanner:run -f html -t "changed-sources/force-app" -e "eslint,retire-js,pmd,cpd" -c "Design,Best Practices,Code Style,Performance,Security" --outfile reports/scan-reports.html
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && env.SF_RUN_CODE_ANALYZER == 'true' }}
+        with:
+          name: cli-scan-report
+          path: reports/scan-reports.html
+          if-no-files-found: warn
+
+      - name: Validate Salesforce (delta dry-run)
+        if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+        shell: pwsh
+        run: |
+          $alias = $env:SF_ALIAS
+          $prTargetBranch = $env:SYSTEM_PULLREQUEST_TARGETBRANCH
+
+          Write-Host "******Validate Salesforce******"
+          sf alias list
+          sf sgd source delta --to "HEAD" --from "HEAD^" --output . --ignore-destructive ignoredestructive --include-destructive includedestructive --ignore-file ignorefile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+          $artifactFolder = "artifacts"
+          if (!(Test-Path $artifactFolder)) {
+            New-Item -ItemType Directory -Force -Path $artifactFolder | Out-Null
+          }
+          Copy-Item -Path "package/package.xml" -Destination "$artifactFolder/package_$timestamp.xml"
+          Copy-Item -Path "destructiveChanges/destructiveChanges.xml" -Destination "$artifactFolder/destructiveChanges_$timestamp.xml"
+
+          Write-Host "***********Added/Modified files in package.xml*************************"
+          Get-Content package/package.xml
+          Write-Host "***********Removed/Deleted files in destructiveChanges.xml*************"
+          Get-Content destructiveChanges/destructiveChanges.xml
+
+          $PackageXml = Get-Content package/package.xml -Raw
+          if ($prTargetBranch -match 'refs/heads/main') {
+            Write-Host "This is a Main branch!. Executing Validations with RunLocalTests"
+            sf project deploy start --manifest package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml --target-org $alias --test-level RunLocalTests --dry-run --wait 120 --verbose
+          }
+          elseif ($PackageXml -match '<name>ApexClass</name>' -or $PackageXml -match '<name>ValidationRule</name>' -or $PackageXml -match '<name>Flow</name>') {
+            sf project deploy start --manifest package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml --target-org $alias --test-level RunLocalTests --dry-run --wait 120 --verbose
+          }
+          else {
+            sf project deploy start --manifest package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml --ignore-conflicts --target-org $alias --test-level NoTestRun --dry-run --wait 120 --verbose
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $deploymentStatus = sf project deploy report --target-org $alias --use-most-recent --wait 120
+          if ($deploymentStatus | Select-String -Pattern "Succeeded") {
+            Write-Host "***********************Validation Succeeded****************************"
+          }
+          elseif ($deploymentStatus | Select-String -Pattern "Failed") {
+            Write-Host "***********************Validation Failed*******************************"
+            exit 1
+          }
+          elseif ($deploymentStatus | Select-String -Pattern "Canceled") {
+            Write-Host "***********************Validation Canceled*****************************"
+            exit 1
+          }
+          else {
+            Write-Host "*************Failed to Validate Delta Package**************************"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && github.event_name == 'pull_request' && github.event.action != 'closed' }}
+        with:
+          name: Delta-Package
+          path: artifacts/
+          if-no-files-found: warn
+
+      # --- develop branch: authenticate and deploy (ADO Build.SourceBranchName == develop) ---
+      - name: Authenticate Salesforce ORG (deploy)
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          extra=""
+          if [ "$SF_IS_DEV_HUB" = "true" ]; then
+            extra="--set-default-dev-hub"
+          fi
+          sf org login jwt --client-id "$SF_CLIENT_ID" --jwt-key-file "$GITHUB_WORKSPACE/privatekey.key" --username "$SF_USERNAME" --instance-url "$SF_INSTANCE_URL" --alias "$SF_ALIAS" $extra
+
+      - name: Deploy Salesforce (delta)
+        if: ${{ github.event_name == 'push' }}
+        shell: pwsh
+        run: |
+          $alias = $env:SF_ALIAS
+          $SourceBranch = $env:BUILD_SOURCEBRANCH
+
+          Write-Host "******Deploy Salesforce******"
+          sf alias list
+          sf sgd source delta --to "HEAD" --from "HEAD^" --output . --ignore-destructive ignoredestructive --include-destructive includedestructive --ignore-file ignorefile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Write-Host "***********Added/Modified files in package.xml*************************"
+          Get-Content package/package.xml
+          Write-Host "***********Removed/Deleted files in destructiveChanges.xml*************"
+          Get-Content destructiveChanges/destructiveChanges.xml
+
+          if ($SourceBranch -match 'refs/heads/main') {
+            Write-Host "This is a Main branch!. Executing Deployments with RunLocalTests"
+            sf project deploy start --manifest package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml --ignore-conflicts --target-org $alias --test-level RunLocalTests --wait 120 --verbose
+          }
+          else {
+            sf project deploy start --manifest package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml --ignore-conflicts --target-org $alias --test-level NoTestRun --wait 120 --verbose
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $deploymentStatus = sf project deploy report --target-org $alias --use-most-recent --wait 120
+          if ($deploymentStatus | Select-String -Pattern "Succeeded") {
+            Write-Host "***********************Deployment Succeeded****************************"
+          }
+          elseif ($deploymentStatus | Select-String -Pattern "Failed") {
+            Write-Host "***********************Deployment Failed*******************************"
+            exit 1
+          }
+          elseif ($deploymentStatus | Select-String -Pattern "Canceled") {
+            Write-Host "***********************Deployment Canceled*****************************"
+            exit 1
+          }
+          else {
+            Write-Host "*************Failed to Deploy Delta Package**************************"
+            exit 1
+          }
